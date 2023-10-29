@@ -1,428 +1,738 @@
-#!/usr/bin/env python
+import sys
 import os
+import re
+import glob
 
-COMMENT = '//'
+class VMCommand():
+    """
+    provides simpler interface and encapsulation for inspecting current command
+    """
+    COMMENT_SYMBOL = '//'
+    NEWLINE_SYMBOL = '\n'
+    EMPTY_SYMBOL = ''
+    COMPARISON_OPERATIONS = [ 'eq', 'lt', 'gt' ]
+    ARITHMETIC_BINARY_OPERATIONS = [ 'add', 'sub', 'and', 'or' ]
+    ARITHMETIC_UNARY_OPERATIONS = [ 'neg', 'not' ]
 
-# Create one per input file
-class Parser(object):
-    def __init__(self, vm_filename):
-        self.vm_filename = vm_filename
-        self.vm = open(vm_filename, 'r')
-        self.EOF = False
-        self.commands = self.commands_dict()
-        self.curr_instruction = None
-        self.initialize_file()
+    def __init__(self, raw_text):
+        self.raw_text = raw_text
 
-    #######
-    ### API
+    def text(self):
+        return self.raw_text.split(self.COMMENT_SYMBOL)[0].strip()
+
+    def parts(self):
+        return self.text().split(' ')
+
+    def label(self):
+        if self.is_branching_command():
+            return self.parts()[1]
+
+    def function_name(self):
+        if self.is_function_definition_command() or self.is_function_call_command():
+            return self.parts()[1]
+
+    def num_arguments(self):
+        if self.is_function_call_command():
+            return self.parts()[2]
+
+    def locals(self):
+        if self.is_function_definition_command():
+            return self.parts()[2]
+
+    def for_static_memory_segment(self):
+        if self.memory_access_command():
+            return self.segment() == 'static'
+
+    def segment(self):
+        if self.memory_access_command():
+            return self.parts()[1]
+
+    def index(self):
+        if self.memory_access_command():
+            return self.parts()[2]
+
+    def is_function_command(self):
+        return self.is_function_definition_command() or self.is_call_command() or self.is_return_command()
+
+    def is_function_definition_command(self):
+        return self.operation() == 'function'
+
+    def is_function_call_command(self):
+        return self.operation() == 'call'
+
+    def is_return_command(self):
+        return self.operation() == 'return'
+
+    def is_branching_command(self):
+        return self.is_goto_command() or self.is_label_command() or self.is_ifgoto_command()
+
+    def is_goto_command(self):
+        return self.operation() == 'goto'
+
+    def is_ifgoto_command(self):
+        return self.operation() == 'if-goto'
+
+    def is_label_command(self):
+        return self.operation() == 'label'
+
+    def is_push_or_pop_command(self):
+        return self.is_push_command() or self.is_pop_command()
+
+    def is_push_command(self):
+        return self.operation() == 'push'
+
+    def is_pop_command(self):
+        return self.operation() == 'pop'
+
+    def is_comment(self):
+        return self.raw_text[0:2] == self.COMMENT_SYMBOL
+
+    def is_whitespace(self):
+        return self.raw_text == self.NEWLINE_SYMBOL
+
+    def is_empty(self):
+        return self.raw_text == self.EMPTY_SYMBOL
+
+    def operation(self):
+        return self.parts()[0]
+
+    def memory_access_command(self):
+        return len(self.parts()) == 3
+
+    def is_logical_command(self):
+        return self.is_comparison_command() or self.is_arithmetic_binary_command() or self.is_arithmetic_unary_command()
+
+    def is_comparison_command(self):
+        return self.operation() in self.COMPARISON_OPERATIONS
+
+    def is_arithmetic_binary_command(self):
+        return self.operation() in self.ARITHMETIC_BINARY_OPERATIONS
+
+    def is_arithmetic_unary_command(self):
+        return self.operation() in self.ARITHMETIC_UNARY_OPERATIONS
+
+class VMParser():
+    """
+    Encapsulates access to the input code in the file
+    Reads VM commands, parses them and provides a convenient access to their components
+    Ignores Whitespace and Comments
+    """
+    def __init__(self, input_file):
+        self.input_file = open(input_file, 'r')
+        self.has_more_commands = True
+        self.current_command = None
+        self.next_command = None
+
+    def has_invalid_current_command(self):
+        return self.current_command.is_whitespace() or self.current_command.is_comment()
+
     def advance(self):
-        self.curr_instruction = self.next_instruction
-        self.load_next_instruction()
+        self._update_current_command()
+        self._update_next_command()
+        self._update_has_more_commands()
 
-    @property
-    def has_more_commands(self):
-        return not self.EOF
+    def _update_has_more_commands(self):
+        if self.next_command.is_empty():
+            self.has_more_commands = False
 
-    @property
-    def command_type(self):
-        return self.commands.get(self.curr_instruction[0].lower())
+    def _update_next_command(self):
+        text = self.input_file.readline()
+        self.next_command = VMCommand(text)
 
-    @property
-    def arg1(self):
-        '''Math operation if C_ARITHMETIC'''
-        if self.command_type == 'C_ARITHMETIC':
-            return self.argn(0)
-        return self.argn(1)
+    def _update_current_command(self):
+        # initialization
+        if self.current_command == None:
+            text = self.input_file.readline()
+            self.current_command = VMCommand(text)
+        else:
+            self.current_command = self.next_command
 
-    @property
-    def arg2(self):
-        '''Only return if C_PUSH, C_POP, C_FUNCTION, C_CALL'''
-        return self.argn(2)
+class VMWriter():
+    """
+    simply wrapper for interacting with output file
+    """
+    def __init__(self, output_file_name):
+        self.output_file = open(output_file_name, 'w')
 
-    ### END API
-    ###########
-    def close(self):
-        self.vm.close()
+    def write(self, command):
+        self.output_file.write(command + "\n")
 
-    def initialize_file(self):
-        self.vm.seek(0)
-        self.load_next_instruction()
+    def close_file(self):
+        self.output_file.close()
 
-    def load_next_instruction(self, line=None):
-        loaded = False
-        while not loaded and not self.EOF:
-            tell = self.vm.tell()
-            line = self.vm.readline().strip()
-            if self.is_instruction(line):
-                self.next_instruction = line.split(COMMENT)[0].strip().split()
-                loaded = True
-            if tell == self.vm.tell(): # File position did not change
-                self.EOF = True
 
-    def is_instruction(self, line):
-        return line and line[:2] != COMMENT
+class VMLogicalTranslator():
+    ARITHMETIC_OPERATIONS_ASM_INSTRUCTIONS = {
+        'add': 'M=M+D',
+        'sub': 'M=M-D',
+        'neg': 'M=-M',
+        'or' : 'M=M|D',
+        'not': 'M=!M',
+        'and': 'M=M&D'
+    }
 
-    def argn(self, n):
-        if len(self.curr_instruction) >= n+1:
-            return self.curr_instruction[n]
-        return None
+    COMPARISON_OPERATIONS_JUMP_DIRECTIVES = {
+        'eq': 'JNE',
+        'lt': 'JGE',
+        'gt': 'JLE'
+    }
 
-    def commands_dict(self):
-        return {
-            'add': 'C_ARITHMETIC',
-            'sub': 'C_ARITHMETIC',
-            'neg': 'C_ARITHMETIC',
-             'eq': 'C_ARITHMETIC',
-             'gt': 'C_ARITHMETIC',
-             'lt': 'C_ARITHMETIC',
-            'and': 'C_ARITHMETIC',
-             'or': 'C_ARITHMETIC',
-            'not': 'C_ARITHMETIC',
-           'push': 'C_PUSH',
-            'pop': 'C_POP',
-          'label': 'C_LABEL',
-           'goto': 'C_GOTO',
-        'if-goto': 'C_IF',
-       'function': 'C_FUNCTION',
-         'return': 'C_RETURN',
-           'call': 'C_CALL'
+    def __init__(self):
+        self.comparison_counters = {
+            'eq' : { 'count': 0 },
+            'lt' : { 'count': 0 },
+            'gt' : { 'count': 0 }
         }
 
+    def translate_arithmetic_binary(self, command):
+        return [
+            *self._pop_top_number_off_stack_instructions(),
+            # put in temp D for operation
+            'D=M',
+            *self._pop_top_number_off_stack_instructions(),
+            self.ARITHMETIC_OPERATIONS_ASM_INSTRUCTIONS[command.operation()],
+            *self._increment_stack_pointer_instructions()
+        ]
 
-class CodeWriter(object):
-    '''Write .asm files
+    def translate_arithmetic_unary(self, command):
+        return [
+            *self._pop_top_number_off_stack_instructions(),
+            self.ARITHMETIC_OPERATIONS_ASM_INSTRUCTIONS[command.operation()],
+            *self._increment_stack_pointer_instructions()
+        ]
 
-    Contract between methods:
-    1. Contents of the A and D registries are not guaranteed,
-        so methods must set them to the values they need.
-    2. Methods must always leave @SP pointing to the correct location.
-    '''
-    def __init__(self, asm_filename):
-        self.asm = open(asm_filename, 'w')
-        self.curr_file = None
-        self.addresses = self.address_dict()
-        self.line_count = 0
-        self.bool_count = 0 # Number of boolean comparisons so far
-        self.call_count = 0 # Number of function calls so far
+    def translate_comparison(self, command):
+        counter = self.comparison_counters[command.operation()]
+        counter['count'] += 1
+        label_identifier = '{}{}'.format(command.text().upper(), counter['count'])
+        jump_directive = self.COMPARISON_OPERATIONS_JUMP_DIRECTIVES[command.operation()]
 
-    #######
-    ### API
-    def write_init(self):
-        self.write('@256')
-        self.write('D=A')
-        self.write('@SP')
-        self.write('M=D')
-        self.write_call('Sys.init', 0)
-        # self.write('@Sys.init')
-        # self.write('0;JMP')
+        return [
+            *self._pop_top_number_off_stack_instructions(),
+            # set D to top of stack
+            'D=M',
+            *self._pop_top_number_off_stack_instructions(),
+            # set D to x-y
+            'D=M-D',
+            # load not true label
+            '@NOT_{}'.format(label_identifier),
+            # jump to not true section on directive
+            'D;{}'.format(jump_directive),
+            # load stack pointer
+            '@SP',
+            # set A to top of stack address
+            'A=M',
+            # set it to -1 for true
+            'M=-1',
+            # load inc stack pointer
+            '@INC_STACK_POINTER_{}'.format(label_identifier),
+            # jump uncoditionally
+            '0;JMP',
+            # not true section
+            '(NOT_{})'.format(label_identifier),
+            # load stack pointer
+            '@SP',
+            # set A to to top of stack address
+            'A=M',
+            # set to 0 for false
+            'M=0',
+            # define inc stack pointer label
+            '(INC_STACK_POINTER_{})'.format(label_identifier),
+            *self._increment_stack_pointer_instructions()
+        ]
 
-    def set_file_name(self, vm_filename):
-        '''Reset pointers'''
-        self.curr_file = vm_filename.replace('.vm', '').split('/')[-1]
-        # self.curr_file = vm_filename.replace('.vm', '')
-        self.write('//////', code=False)
-        self.write('// {}'.format(self.curr_file), code=False)
+    def _pop_top_number_off_stack_instructions(self):
+        return [
+            # load stack pointer
+            '@SP',
+            # decrement stack pointer and set address
+            'AM=M-1'
+        ]
 
-    def write_arithmetic(self, operation):
-        '''Apply operation to top of stack'''
-        if operation not in ['neg', 'not']: # Binary operator
-            self.pop_stack_to_D()
-        self.decrement_SP()
-        self.set_A_to_stack()
+    def _increment_stack_pointer_instructions(self):
+        return [
+            # load stack pointer
+            '@SP',
+            # increment stack pointer
+            'M=M+1'
+        ]
 
-        if operation == 'add': # Arithmetic operators
-            self.write('M=M+D')
-        elif operation == 'sub':
-            self.write('M=M-D')
-        elif operation == 'and':
-            self.write('M=M&D')
-        elif operation == 'or':
-            self.write('M=M|D')
-        elif operation == 'neg':
-            self.write('M=-M')
-        elif operation == 'not':
-            self.write('M=!M')
-        elif operation in ['eq', 'gt', 'lt']: # Boolean operators
-            self.write('D=M-D')
-            self.write('@BOOL{}'.format(self.bool_count))
 
-            if operation == 'eq':
-                self.write('D;JEQ') # if x == y, x - y == 0
-            elif operation == 'gt':
-                self.write('D;JGT') # if x > y, x - y > 0
-            elif operation == 'lt':
-                self.write('D;JLT') # if x < y, x - y < 0
+class VMPushPopTranslator():
+    VIRTUAL_MEMORY_SEGMENTS_BASE_ADDRESSES = {
+        'local': '1',
+        'argument': '2',
+        'this': '3',
+        'that': '4'
+    }
+    POINTER_SEGMENT_BASE_ADDRESS = '3'
+    TEMP_SEGMENT_BASE_ADDRESS = '5'
+    STATIC_SEGMENT_BASE_ADDRESS = '16'
 
-            self.set_A_to_stack()
-            self.write('M=0') # False
-            self.write('@ENDBOOL{}'.format(self.bool_count))
-            self.write('0;JMP')
+    def translate_static_pop(self, command, current_file_name):
+        return [
+            *self.store_top_of_stack_in_D_instructions(),
+            # set value at address to D
+            *self.set_address_to_top_of_stack_instructions(
+                address='{}.{}'.format(current_file_name, command.index())
+            )
+        ]
 
-            self.write('(BOOL{})'.format(self.bool_count), code=False)
-            self.set_A_to_stack()
-            self.write('M=-1') # True
+    def translate_static_push(self, command, current_file_name):
+        return [
+            # load Filename.index
+            *self.load_referenced_value_in_D_instructions(
+                '{}.{}'.format(current_file_name, command.index()),
+            ),
+            *self.place_value_in_D_on_top_of_stack_instructions(),
+            *self.increment_stack_pointer_instructions()
+        ]
 
-            self.write('(ENDBOOL{})'.format(self.bool_count), code=False)
-            self.bool_count += 1
+    def translate_push(self, command):
+        # Push the value of segment[index] onto the stack
+        return [
+            *self._load_desired_value_into_D_instructions_for(command),
+            *self._place_value_in_D_on_top_of_stack_instructions(),
+            *self._increment_stack_pointer_instructions()
+        ]
+
+    def translate_pop(self, command):
+        return [
+            *self._store_top_of_stack_in_D_instructions(),
+            *self._store_top_of_stack_first_temp_register_instructions(),
+            *self._load_base_address_instructions_for(segment=command.segment()),
+            *self._add_index_to_base_address_in_D_instructions(command),
+            *self._store_target_address_in_second_temp_register_instructions(),
+            *self._set_target_address_to_value_instructions()
+        ]
+
+    def _load_desired_value_into_D_instructions_for(self, command):
+        if command.segment() == 'constant':
+            return [
+                *self._load_value_in_D_instructions(value=command.index())
+            ]
         else:
-            self.raise_unknown(operation)
-        self.increment_SP()
+            return [
+                *self._load_base_address_instructions_for(segment=command.segment()),
+                *self._add_index_to_base_address_in_D_instructions(command),
+                *self._load_value_at_memory_address_in_D_instructions()
+            ]
 
-    def write_push_pop(self, command, segment, index):
-        self.resolve_address(segment, index)
-        if command == 'C_PUSH': # load M[address] to D
-            if segment == 'constant':
-                self.write('D=A')
-            else:
-                self.write('D=M')
-            self.push_D_to_stack()
-        elif command == 'C_POP': # load D to M[address]
-            self.write('D=A')
-            self.write('@R13') # Store resolved address in R13
-            self.write('M=D')
-            self.pop_stack_to_D()
-            self.write('@R13')
-            self.write('A=M')
-            self.write('M=D')
-        else:
-            self.raise_unknown(command)
+    def _load_base_address_instructions_for(self, segment):
+        if segment in self.VIRTUAL_MEMORY_SEGMENTS_BASE_ADDRESSES:
+            pointer_to_segment_base_address = self.VIRTUAL_MEMORY_SEGMENTS_BASE_ADDRESSES[segment]
+            return self._load_referenced_value_in_D_instructions(address=pointer_to_segment_base_address)
+        elif segment == 'temp':
+            return self.load_value_in_D_instructions(value=self.TEMP_SEGMENT_BASE_ADDRESS)
+        elif segment == 'static':
+            return self.load_value_in_D_instructions(value=self.STATIC_SEGMENT_BASE_ADDRESS)
+        elif segment == 'pointer':
+            return self.load_value_in_D_instructions(value=self.POINTER_SEGMENT_BASE_ADDRESS)
 
-    def write_label(self, label):
-        self.write('({}${})'.format(self.curr_file, label), code=False)
+    def _place_value_in_D_on_top_of_stack_instructions(self):
+        return [
+            # load stack pointer
+            '@SP',
+            # Get current address
+            'A=M',
+            # Store constant in address
+            'M=D'
+        ]
 
-    def write_goto(self, label):
-        self.write('@{}${}'.format(self.curr_file, label))
-        self.write('0;JMP')
+    def _increment_stack_pointer_instructions(self):
+        return [
+            # load stack pointer
+            '@SP',
+            # increment stack pointer
+            'M=M+1'
+        ]
 
-    def write_if(self, label):
-        self.pop_stack_to_D()
-        self.write('@{}${}'.format(self.curr_file, label))
-        self.write('D;JNE')
+    def _load_value_in_D_instructions(self, value):
+        return [
+            # load value
+            '@' + value,
+            # store value in D
+            'D=A'
+        ]
 
-    def write_function(self, function_name, num_locals):
-        # (f)
-        self.write('({})'.format(function_name), code=False)
+    def _load_referenced_value_in_D_instructions(self, address):
+        return [
+            # load address
+            '@' + address,
+            # store address value
+            'D=M'
+        ]
 
-        # k times: push 0
-        for _ in xrange(num_locals): # Initialize local vars to 0
-            self.write('D=0')
-            self.push_D_to_stack()
+    def _add_index_to_base_address_in_D_instructions(self, command):
+        return [
+            '@' + command.index(),
+            'D=D+A'
+        ]
 
-    def write_call(self, function_name, num_args):
-        RET = function_name + 'RET' +  str(self.call_count) # Unique return label
+    def _load_value_at_memory_address_in_D_instructions(self):
+        return [
+            # set A to address stored in D
+            'A=D',
+            # now put value at new address in D
+            'D=M'
+        ]
+
+    def _set_address_to_top_of_stack_instructions(self, address):
+        return [
+            # load segment address
+            '@' + address,
+            # set segment equal to top of stack
+            'M=D'
+        ]
+
+    # makes use of temp registers
+    def _set_target_address_to_value_instructions(self):
+        return [
+            # load top of stack value
+            '@R13',
+            # store in D
+            'D=M',
+            # load segment + index address
+            '@R14',
+            # set as current address register
+            'A=M',
+            # set segment[index] to stack top
+            'M=D'
+        ]
+
+    # makes use of temp registers
+    def _store_target_address_in_second_temp_register_instructions(self):
+        return [
+            # load temp
+            '@R14',
+            # store segment + index address
+            'M=D'
+        ]
+
+    # makes use of temp registers
+    # (when top of stack already in D)
+    def _store_top_of_stack_first_temp_register_instructions(self):
+        return [
+            # load temp register
+            '@R13',
+            # store top of stack in temp register
+            'M=D'
+        ]
+
+    def _store_top_of_stack_in_D_instructions(self):
+        return [
+            # load stack pointer
+            '@SP',
+            # decrement pointer to top of stack
+            'AM=M-1',
+            # store value in D
+            'D=M'
+        ]
+
+class VMBranchingTranslator():
+    def translate_label(self, command):
+        return [
+            '({})'.format(command.label())
+        ]
+
+    def translate_goto(self, command):
+        # unconditionally jump to label
+        return [
+            '@' + command.label(),
+            '0;JMP'
+        ]
+
+    def translate_ifgoto(self, command):
+        # jump if the topmost item on the stack is not equal to zero
+        return [
+            # pop top most item off stack
+            '@SP',
+            'AM=M-1',
+            'D=M',
+            # jump is not 0
+            '@' + command.label(),
+            'D;JNE'
+        ]
+
+class VMFunctionTranslator():
+    NUM_SEGMENTS_COPIED_TO_NEW_STACK_FRAME = 5
+
+    def __init__(self):
+        self.function_count = 0
+        self.call_count = 0
+
+    def init_code(self):
+        return [
+            # set SP = 256
+            '@256',
+            'D=A',
+            '@SP',
+            'M=D',
+            # call Sys.init
+            *self.translate_function_call(VMCommand('call Sys.init 0'))
+        ]
+
+    def translate_function_definition(self, command):
+        self.function_count += 1
+
+        return [
+            # establish function label -> will be used to jump to spot when called
+            '({})'.format(command.function_name()),
+            ## push onto the stack 0 command.locals() times
+            # initialize loop times
+            '@' + command.locals(),
+            # store in D
+            'D=A',
+            # establish loop label
+            '(LOOP.ADD_LOCALS.{})'.format(self.function_count),
+            # skip if D eq 0
+            '@NO_LOCALS.{}'.format(self.function_count),
+            'D;JEQ',
+            ## push 0 onto stack D times
+            # load stack pointer
+            '@SP',
+            # get pointer address
+            'A=M',
+            # set to 0
+            'M=0',
+            # increment stack pointer
+            '@SP',
+            'M=M+1',
+            # decrement D
+            'D=D-1',
+            # load loop
+            '@LOOP.ADD_LOCALS.{}'.format(self.function_count),
+            # jump back if not 0
+            'D;JNE',
+            '(NO_LOCALS.{})'.format(self.function_count)
+        ]
+
+    def translate_function_call(self, command):
         self.call_count += 1
 
-        # push return-address
-        self.write('@' + RET)
-        self.write('D=A')
-        self.push_D_to_stack()
+        return [
+            ## push return address onto stack
+            # load return address label
+            '@RET_ADDRESS.{}'.format(self.call_count),
+            # get address value
+            'D=A',
+            # load stack pointer
+            '@SP',
+            # load address
+            'A=M',
+            # set value at address to D, return address
+            'M=D',
+            # increment stack pointer
+            '@SP',
+            'M=M+1',
+            ## push LCL address onto stack
+            *self._push_referenced_address_onto_stack('LCL'),
+            ## push ARG address onto stack
+            *self._push_referenced_address_onto_stack('ARG'),
+            ## push THIS address onto stack
+            *self._push_referenced_address_onto_stack('THIS'),
+            ## push THAT address onto stack
+            *self._push_referenced_address_onto_stack('THAT'),
+            ## ARG = SP - nArgs - 5
+            # get value of SP
+            '@SP',
+            'D=M',
+            # substract num arguments
+            '@{}'.format(command.num_arguments()),
+            'D=D-A',
+            # subtract 5
+            '@{}'.format(self.NUM_SEGMENTS_COPIED_TO_NEW_STACK_FRAME),
+            'D=D-A',
+            # set ARG
+            '@ARG',
+            'M=D',
+            ## LCL = SP reposition LCL
+            '@SP',
+            'D=M',
+            '@LCL',
+            'M=D',
+            ## jump to function (which will run this function's instructions)
+            '@{}'.format(command.function_name()),
+            '0;JMP',
+            ## label for return address
+            '(RET_ADDRESS.{})'.format(self.call_count)
+        ]
 
-        # push LCL
-        # push ARG
-        # push THIS
-        # push THAT
-        for address in ['@LCL', '@ARG', '@THIS', '@THAT']:
-            self.write(address)
-            self.write('D=M')
-            self.push_D_to_stack()
+    def translate_return(self, command):
+        return [
+            # FRAME=LCL // FRAME is a temporary variable
+            '@LCL',
+            # store in D
+            'D=M', # Frame
+            # load temp register
+            '@R13',
+            # store Frame in temp register
+            'M=D',
+            # RET=*(FRAME-5) // save return address in a temp. var
+            # load value to subtract
+            '@5',
+            # store value in D
+            'D=A',
+            # load frame from temp
+            '@R13',
+            # get address value into A
+            'A=M-D',
+            # dereference to get value at mem address
+            'D=M',
+            # load into temp reg
+            '@R14',
+            'M=D',
+            # *ARG=pop() // reposition return value for caller
+            # pop of stack off into D
+            '@SP',
+            # decrment address and stack pointer
+            'AM=M-1',
+            # store value at top of stack in D
+            'D=M',
+            # set top of arg stack to return value for caller
+            '@ARG',
+            # get register access at memory address
+            'A=M',
+            # set to D, top of stack value
+            'M=D',
+            #SP=ARG+1 // restore SP for caller
+            '@ARG',
+            # store current address of ARG + 1 in D
+            'D=M+1',
+            # load stack pointer
+            '@SP',
+            # set address to arg + 1
+            'M=D',
+            *self._restore_calling_function('THAT', slots_behind_frame_end=1),
+            *self._restore_calling_function('THIS', slots_behind_frame_end=2),
+            *self._restore_calling_function('ARG', slots_behind_frame_end=3),
+            *self._restore_calling_function('LCL', slots_behind_frame_end=4),
+            #goto RET // GOTO the return-address
+            # load RET
+            '@R14',
+            'A=M',
+            # go to RET
+            '0;JMP'
+        ]
 
-        # LCL = SP
-        self.write('@SP')
-        self.write('D=M')
-        self.write('@LCL')
-        self.write('M=D')
+    def _push_referenced_address_onto_stack(virtual_memory_segment):
+        return [
+            # load register with address value
+            '@{}'.format(virtual_memory_segment),
+            # get its address
+            'D=M',
+            # load stack pointer
+            '@SP',
+            # load address
+            'A=M',
+            # set value at address to D, return address
+            'M=D',
+            # increment stack pointer
+            '@SP',
+            'M=M+1',
+        ]
 
-        # ARG = SP-n-5
-        # self.write('@SP') # Redundant b/c of prev two commands
-        # self.write('D=M') # Redundant b/c of prev two commands
-        self.write('@' + str(num_args + 5))
-        self.write('D=D-A')
-        self.write('@ARG')
-        self.write('M=D')
+    def _restore_calling_function(self, memory_segment, slots_behind_frame_end):
+        return [
+            # load delta before frame end
+            '@{}'.format(slots_behind_frame_end),
+            # place in D
+            'D=A',
+            # load frame
+            '@R13',
+            # get address value into A
+            'A=M-D',
+            # dereference to get value at mem address
+            'D=M',
+            # load LCL
+            '@{}'.format(memory_segment),
+            # set value at THAT to D
+            'M=D'
+        ]
 
-        # goto f
-        self.write('@' + function_name)
-        self.write('0;JMP')
+class Main():
+    def __init__(self, input):
+        self.input = input
+        self.current_file = None
+        # maybe these go inside the translator and wrap up to 1 translate method
+        self.logical_translator = VMLogicalTranslator()
+        self.push_pop_translator = VMPushPopTranslator()
+        self.branching_translator = VMBranchingTranslator()
+        self.function_translator = VMFunctionTranslator()
 
-        # (return_address)
-        self.write('({})'.format(RET), code=False)
+    def run_program(self):
+        if os.path.isfile(self.input):
+            # get vm files to translate
+            vm_files = [self.input]
+            # get output file name
+            ouput_file_name = input.split('.')[0] + '.asm'
+            # init writer
+            writer = VMWriter(output_file_name)
+        elif os.path.isdir(self.input):
+            # get vm files to translate
+            vm_path = os.path.join(self.input, "*.vm")
+            vm_files = glob.glob(vm_path)
+            # get output file name
+            last_dir_name = os.path.basename(input)
+            output_file_name = input + "/" + last_dir_name + ".asm"
+            # init writer
+            writer = VMWriter(output_file_name)
+            # init code specific for directory
+            init_code = self.function_translator.init_code()
+            for line in init_code:
+                writer.write(line)
 
-    def write_return(self):
-        # Temporary variables
-        FRAME = 'R13'
-        RET = 'R14'
+        for vm_file in vm_files:
+            self.current_file = vm_file
+            parser = VMParser(vm_file)
 
-        # FRAME = LCL
-        self.write('@LCL')
-        self.write('D=M')
-        self.write('@' + FRAME)
-        self.write('M=D')
+            while parser.has_more_commands:
+                parser.advance()
 
-        # RET = *(FRAME-5)
-        # Can't be included in iterator b/c value will be overwritten if num_args=0
-        self.write('@' + FRAME)
-        self.write('D=M') # Save start of frame
-        self.write('@5')
-        self.write('D=D-A') # Adjust address
-        self.write('A=D') # Prepare to load value at address
-        self.write('D=M') # Store value
-        self.write('@' + RET)
-        self.write('M=D') # Save value
+                if parser.has_invalid_current_command():
+                    continue
 
-        # *ARG = pop()
-        self.pop_stack_to_D()
-        self.write('@ARG')
-        self.write('A=M')
-        self.write('M=D')
+                translation = _self.find_translation_for(parser.current_command)
+                for line in translation:
+                    writer.write(line)
 
-        # SP = ARG+1
-        self.write('@ARG')
-        self.write('D=M')
-        self.write('@SP')
-        self.write('M=D+1')
+        writer.close_file()
 
-        # THAT = *(FRAME-1)
-        # THIS = *(FRAME-2)
-        # ARG = *(FRAME-3)
-        # LCL = *(FRAME-4)
-        offset = 1
-        for address in ['@THAT', '@THIS', '@ARG', '@LCL']:
-            self.write('@' + FRAME)
-            self.write('D=M') # Save start of frame
-            self.write('@' + str(offset))
-            self.write('D=D-A') # Adjust address
-            self.write('A=D') # Prepare to load value at address
-            self.write('D=M') # Store value
-            self.write(address)
-            self.write('M=D') # Save value
-            offset += 1
+    def _find_translation_for(self, current_command):
+        if current_command.is_push_command():
+            if current_command.for_static_memory_segment():
+                return self.push_pop_translator.translate_static_push(current_command, self._current_filename_without_extension())
+            else:
+                return self.push_pop_translator.translate_push(current_command)
+        elif current_command.is_pop_command():
+            if current_command.for_static_memory_segment():
+                return self.push_pop_translator.translate_static_pop(current_command, self._current_filename_without_extension())
+            else:
+                return self.push_pop_translator.translate_pop(current_command)
+        elif current_command.is_return_command():
+            return self.function_translator.translate_return(current_command)
+        elif current_command.is_function_definition_command():
+            return self.function_translator.translate_function_definition(current_command)
+        elif current_command.is_function_call_command():
+            return self.function_translator.translate_function_call(current_command)
+        elif current_command.is_label_command():
+            return self.branching_translator.translate_label(current_command)
+        elif current_command.is_goto_command():
+            return self.branching_translator.translate_goto(current_command)
+        elif current_command.is_ifgoto_command():
+            return self.branching_translator.translate_ifgoto(current_command)
+        elif current_command.is_arithmetic_binary_command():
+            return self.logical_translator.translate_arithmetic_binary(current_command)
+        elif current_command.is_arithmetic_unary_command():
+            return self.logical_translator.translate_arithmetic_unary(current_command)
+        elif current_command.is_comparison_command():
+            return self.logical_translator.translate_comparison(current_command)
 
-        # goto RET
-        self.write('@' + RET)
-        self.write('A=M')
-        self.write('0;JMP')
-
-    ### END API
-    ###########
-    def write(self, command, code=True):
-        self.asm.write(command)
-        if code:
-            self.asm.write(' // ' + str(self.line_count))
-            self.line_count += 1
-        self.asm.write('\n')
-
-    def close(self):
-        self.asm.close()
-
-    def raise_unknown(self, argument):
-        raise ValueError('{} is an invalid argument'.format(argument))
-
-    def resolve_address(self, segment, index):
-        '''Resolve address to A register'''
-        address = self.addresses.get(segment)
-        if segment == 'constant':
-            self.write('@' + str(index))
-        elif segment == 'static':
-            self.write('@' + self.curr_file + '.' + str(index))
-        elif segment in ['pointer', 'temp']:
-            self.write('@R' + str(address + index)) # Address is an int
-        elif segment in ['local', 'argument', 'this', 'that']:
-            self.write('@' + address) # Address is a string
-            self.write('D=M')
-            self.write('@' + str(index))
-            self.write('A=D+A') # D is segment base
-        else:
-            self.raise_unknown(segment)
-
-    def address_dict(self):
-        return {
-            'local': 'LCL', # Base R1
-            'argument': 'ARG', # Base R2
-            'this': 'THIS', # Base R3
-            'that': 'THAT', # Base R4
-            'pointer': 3, # Edit R3, R4
-            'temp': 5, # Edit R5-12
-            # R13-15 are free
-            'static': 16, # Edit R16-255
-        }
-
-    def push_D_to_stack(self):
-        '''Push from D onto top of stack, increment @SP'''
-        self.write('@SP') # Get current stack pointer
-        self.write('A=M') # Set address to current stack pointer
-        self.write('M=D') # Write data to top of stack
-        self.increment_SP()
-
-    def pop_stack_to_D(self):
-        '''Decrement @SP, pop from top of stack onto D'''
-        self.decrement_SP()
-        self.write('A=M') # Set address to current stack pointer
-        self.write('D=M') # Get data from top of stack
-
-    def decrement_SP(self):
-        self.write('@SP')
-        self.write('M=M-1')
-
-    def increment_SP(self):
-        self.write('@SP')
-        self.write('M=M+1')
-
-    def set_A_to_stack(self):
-        self.write('@SP')
-        self.write('A=M')
-
-
-class Main(object):
-    def __init__(self, file_path):
-        self.parse_files(file_path)
-        self.cw = CodeWriter(self.asm_file)
-        self.cw.write_init()
-        for vm_file in self.vm_files:
-            self.translate(vm_file)
-        self.cw.close()
-
-    def parse_files(self, file_path):
-        if '.vm' in file_path:
-            self.asm_file = file_path.replace('.vm', '.asm')
-            self.vm_files = [file_path]
-        else:
-            file_path = file_path[:-1] if file_path[-1] == '/' else file_path
-            path_elements = file_path.split('/')
-            path = '/'.join(path_elements)
-            self.asm_file = path + '/' + path_elements[-1] + '.asm'
-            dirpath, dirnames, filenames = next(os.walk(file_path), [[],[],[]])
-            vm_files = filter(lambda x: '.vm' in x, filenames)
-            self.vm_files = [path + '/' +  vm_file for vm_file in vm_files]
-
-    def translate(self, vm_file):
-        parser = Parser(vm_file)
-        self.cw.set_file_name(vm_file)
-        while parser.has_more_commands:
-            parser.advance()
-            self.cw.write('// ' + ' '.join(parser.curr_instruction), code=False)
-            if parser.command_type == 'C_PUSH':
-                self.cw.write_push_pop('C_PUSH', parser.arg1, int(parser.arg2))
-            elif parser.command_type == 'C_POP':
-                self.cw.write_push_pop('C_POP', parser.arg1, int(parser.arg2))
-            elif parser.command_type == 'C_ARITHMETIC':
-                self.cw.write_arithmetic(parser.arg1)
-            elif parser.command_type == 'C_LABEL':
-                self.cw.write_label(parser.arg1)
-            elif parser.command_type == 'C_GOTO':
-                self.cw.write_goto(parser.arg1)
-            elif parser.command_type == 'C_IF':
-                self.cw.write_if(parser.arg1)
-            elif parser.command_type == 'C_FUNCTION':
-                self.cw.write_function(parser.arg1, int(parser.arg2))
-            elif parser.command_type == 'C_CALL':
-                self.cw.write_call(parser.arg1, int(parser.arg2))
-            elif parser.command_type == 'C_RETURN':
-                self.cw.write_return()
-        parser.close()
+    def _current_filename_without_extension(self):
+        return self.current_file.split(".")[0].split("/")[-1]
 
 
-if __name__ == '__main__':
-    import sys
 
-    file_path = sys.argv[1]
-    Main(file_path)
+if __name__ == "__main__" and len(sys.argv) == 2:
+    input = sys.argv[1]
+    Main(input).run_program()
